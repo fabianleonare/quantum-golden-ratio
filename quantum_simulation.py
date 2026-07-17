@@ -1,95 +1,121 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-from qutip import qeye, sigmax, sigmay, sigmaz, tensor, ptrace, entropy_vn
+from qutip import jmat, sesolve, entropy_vn, ptrace, basis, tensor
 
-# 1. Quantum System Parameters
-N = 6  # Number of qubits in the spin chain
-PHI = (1 + 5**0.5) / 2  # The Golden Ratio (~1.618033)
-
-def build_two_body_operator(op_i, i, op_j, j, N):
-    """Constructs a two-body tensor product operator for sites i and j."""
-    op_list = [qeye(2)] * N
-    op_list[i] = op_i
-    op_list[j] = op_j
-    return tensor(op_list)
-
-def get_hamiltonian(N, alpha, configuration="naressi"):
-    """
-    Constructs the system Hamiltonian to test energy propagation models.
-    Compares conventional cable conduction with Naressi's Geometric Law.
-    """
-    H = 0
-    g = 0.5  # Transverse magnetic field representing environmental quantum fluctuations
+def run_simulation():
+    # 1. Spin Chain Parameter Configuration
+    N = 6                     # Number of nodes (optimized for fast exact diagonalization)
+    phi = (1 + 5**0.5) / 2    # Golden Ratio
+    alpha = 1.0               # Initial scaling parameter
+    beta = 0.15               # Slope for classical linear decay
+    times = np.linspace(0, 10, 150) # Time horizon for the evolution
     
+    print(f"Initializing quantum simulation on a spin chain with N={N} nodes...")
+
+    # Pauli operators for spin-1/2
+    sx = jmat(1/2, 'x')
+    sy = jmat(1/2, 'y')
+    sz = jmat(1/2, 'z')
+
+    # Initial state: all spins aligned along Z except the first one (local excitation)
+    state_list = [basis(2, 1)] + [basis(2, 0) for _ in range(N-1)]
+    psi0 = tensor(state_list)
+
+    # Building interaction operators for the chain (XX Model)
+    interaction_terms = []
     for i in range(N - 1):
-        if configuration == "naressi":
-            # NARESSI'S LAW: Golden ratio geometric coupling combined 
-            # with the space-vacuum dampening factor: e^( -i / phi^2 )
-            J = alpha * (PHI ** (-i)) * np.exp(-i / (PHI ** 2))
-        elif configuration == "classical_linear":
-            # CLASSICAL MODEL: Linear decay proportional to internal cable resistance
-            J = alpha * (1 / (i + 1))
-        else:
-            # UNIFORM IDEAL CONFIGURATION
-            J = alpha
+        # Generate coupling for node i and i+1
+        op_list_x = [qutip.qeye(2)] * N
+        op_list_y = [qutip.qeye(2)] * N
+        op_list_x[i] = sx
+        op_list_x[i+1] = sx
+        op_list_y[i] = sy
+        op_list_y[i+1] = sy
+        interaction_terms.append((tensor(op_list_x), tensor(op_list_y)))
+
+    # 2. Definition of Coupling Profiles (The Three Models)
+    J_constant = [alpha for _ in range(N-1)]
+    J_linear = [max(0.01, alpha - beta * n) for n in range(1, N)]
+    J_naressi = [alpha * (phi**(-n)) * np.exp(-n / (phi**2)) for n in range(1, N)]
+
+    models = {
+        'Constant Ohmic': J_constant,
+        'Classical Linear Decay': J_linear,
+        'Naressi Geometric Law': J_naressi
+    }
+
+    entropy_results = {}
+    fidelity_results = {}
+
+    # 3. Solving Schrödinger Equation for each model
+    for name, J_profile in models.items():
+        print(f"Computing time evolution for model: {name}...")
+        
+        # Build specific Hamiltonian
+        H = 0
+        for n, (op_x, op_y) in enumerate(interaction_terms):
+            H += J_profile[n] * (op_x + op_y)
             
-        H -= J * build_two_body_operator(sigmax(), i, sigmax(), i + 1, N)
+        # Time evolution
+        result = sesolve(H, psi0, times)
+        
+        # Calculate Von Neumann entropy and Fidelity along the evolution
+        entropies = []
+        fidelities = []
+        for state in result.states:
+            # Reduced density matrix for the first subsystem (input node)
+            rho_sub = ptrace(state, [0])
+            s = entropy_vn(rho_sub)
+            entropies.append(s)
+            
+            # Calculate Fidelity with respect to the initial coherent state
+            f = qutip.fidelity(state, psi0)**2
+            fidelities.append(f)
+            
+        entropy_results[name] = entropies
+        fidelity_results[name] = fidelities
+
+    # 4. Statistical Extraction of Final Data
+    print("\n--- EXTRACTED STATISTICAL-NUMERICAL RESULTS ---")
+    for name in models.keys():
+        s_final = entropy_results[name][-1]
+        f_final = fidelity_results[name][-1]
+        
+        # Calculate critical decoherence time (conventional threshold at S > 0.35)
+        t_crit = "> 10.0 (Stable)"
+        for idx, s_val in enumerate(entropy_results[name]):
+            if s_val > 0.35:
+                t_crit = f"{times[idx]:.2f}"
+                break
+                
+        print(f"[{name}] -> Final Entropy: {s_final:.4f} | Critical Time: {t_crit} | Final Fidelity: {f_final:.4f}")
+
+    # 5. Comparative Plot Generation
+    plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+    fig, ax = plt.subplots(figsize=(8, 5))
     
-    # Single-particle transverse field term
-    for i in range(N):
-        op_list = [qeye(2)] * N
-        op_list[i] = sigmaz()
-        H -= g * tensor(op_list)
-        
-    return H
+    colors = {'Constant Ohmic': '#d9534f', 'Classical Linear Decay': '#f0ad4e', 'Naressi Geometric Law': '#5cb85c'}
+    styles = {'Constant Ohmic': '--', 'Classical Linear Decay': ':', 'Naressi Geometric Law': '-'}
+    
+    for name in models.keys():
+        ax.plot(times, entropy_results[name], label=name, color=colors[name], linestyle=styles[name], linewidth=2.5)
 
-# 2. Coupling Parameter Scan for Numerical Proof
-alpha_values = np.linspace(0.0, 3.0, 50)
-configurations = ["classical_linear", "naressi"]
-entropies = {conf: [] for conf in configurations}
-ground_energies = {conf: [] for conf in configurations}
+    ax.set_title("Time Evolution of Von Neumann Entropy\nDissipative Models vs Naressi Geometric Law", fontsize=12, fontweight='bold')
+    ax.set_xlabel("Normalized Time ($t \cdot \alpha$)", fontsize=11)
+    ax.set_ylabel("Von Neumann Entropy $S(t)$", fontsize=11)
+    ax.set_ylim(-0.05, 0.75)
+    ax.legend(frameon=True, facecolor='white', edgecolor='none', fontsize=10)
+    
+    plt.tight_layout()
+    
+    # Saving to Code Ocean mandatory results folder
+    os.makedirs('/results', exist_ok=True)
+    output_path = '/results/model_comparison_entropy.png'
+    plt.savefig(output_path, dpi=300)
+    print(f"\nComparison plot successfully saved to: {output_path}")
 
-print("Running comparative quantum simulation...")
-
-for conf in configurations:
-    for a in alpha_values:
-        H = get_hamiltonian(N, a, configuration=conf)
-        
-        # Exact diagonalization to extract eigenvalues (energy) and eigenstates
-        eigenvalues, eigenstates_list = H.eigenstates()
-        
-        # Store Ground State Energy
-        ground_energies[conf].append(eigenvalues[0])
-        
-        # Compute reduced density matrix (partial trace over the first half of the chain)
-        rho_subsystem = ptrace(eigenstates_list[0], list(range(N // 2)))
-        
-        # Compute Von Neumann Entanglement Entropy
-        s_vn = entropy_vn(rho_subsystem, base=2)
-        entropies[conf].append(s_vn)
-
-# 3. Plotting the Simulation Results for Verification
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-
-# GRAPH 1: Entanglement Entropy Profile (Non-local information capacity)
-ax1.plot(alpha_values, entropies["classical_linear"], label="Classical Cable Model (Linear)", linestyle="--", color="gray")
-ax1.plot(alpha_values, entropies["naressi"], label="Naressi's Geometric Law", linewidth=2.5, color="blue")
-ax1.axvline(x=PHI, color="red", linestyle="-.", label=f"Critical Resonance (α = φ = {PHI:.3f})")
-ax1.set_title("1. Entanglement Profile (Von Neumann Entropy)")
-ax1.set_xlabel("Scaling Parameter (α)")
-ax1.set_ylabel("Entanglement Entropy $S_{VN}$ (Bits)")
-ax1.grid(True, alpha=0.3)
-ax1.legend()
-
-# GRAPH 2: Ground State Energy Level (System Efficiency)
-ax2.plot(alpha_values, ground_energies["classical_linear"], label="Classical Cable Model (Linear)", linestyle="--", color="gray")
-ax2.plot(alpha_values, ground_energies["naressi"], label="Naressi's Geometric Law", linewidth=2.5, color="green")
-ax2.set_title("2. Ground State Energy Profile")
-ax2.set_xlabel("Scaling Parameter (α)")
-ax2.set_ylabel("Ground State Energy $E_0$ (Arbitrary Units)")
-ax2.grid(True, alpha=0.3)
-ax2.legend()
-
-plt.tight_layout()
-plt.show()
-print("Simulation finished. Displaying charts.")
+if __name__ == "__main__":
+    # Protected local import of qutip to ensure runtime stability
+    import qutip
+    run_simulation()
